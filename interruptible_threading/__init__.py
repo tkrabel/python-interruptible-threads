@@ -40,7 +40,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from io import IOBase
 
 __all__ = [
@@ -169,6 +169,8 @@ class _State:
         # the cooperative paths never touch SetAsyncExc -- calling it while a
         # sys.settrace tracer (e.g. coverage) is active can deadlock the thread.
         self.async_armed = False
+        self.cooperative_only = False
+        self.should_interrupt: Callable[[], bool] | None = None
         # Hints used only to pick a wakeup nudge; never the source of truth.
         self.sleeping = False
         self.selecting = False
@@ -242,7 +244,11 @@ def _take_pending(st: _State) -> bool:
 
     Must be called holding ``st.cancel_cond``.
     """
-    if st.pending and st.mask_depth == 0:
+    if (
+        st.pending
+        and st.mask_depth == 0
+        and (st.should_interrupt is None or st.should_interrupt())
+    ):
         st.pending = False
         _disarm_async(st)
         return True
@@ -358,10 +364,7 @@ def interrupts_disabled() -> Iterator[None]:
         raise_now = False
         with st.cancel_cond:
             st.mask_depth -= 1
-            if st.mask_depth == 0 and st.pending:
-                st.pending = False
-                _disarm_async(st)
-                raise_now = True
+            raise_now = _take_pending(st)
         if raise_now:
             raise _INTERRUPT_EXC()
 
@@ -613,6 +616,41 @@ class InterruptibleThread(_ORIG_THREAD):
 
     _patches_installed = False
     _socket_patched = False
+    _thread_patched = False
+    _selector_patched = False
+
+    @contextlib.contextmanager
+    def interruption_scope(
+        self,
+        *,
+        cooperative_only: bool = False,
+        should_interrupt: Callable[[], bool] | None = None,
+    ) -> Iterator[None]:
+        """Register one execution on a thread whose run() is owned by a host.
+
+        Call from this thread with no existing registration. The ordinary run()
+        registers for its entire lifetime, so this API is for subclasses that
+        supply their own runner. Scopes cannot nest.
+
+        cooperative_only disables async exception injection; CPU work must use
+        checkpoints supplied by the caller. should_interrupt gates cooperative
+        delivery and leaves the request pending when false. It runs on the target
+        thread under the state lock and must not block or raise.
+        """
+        if self is not threading.current_thread():
+            raise RuntimeError("interruption_scope must run on the current thread")
+        if _State.get_state_by_ident() is not None:
+            raise RuntimeError("current thread is already registered")
+        st = _State.register_current_thread()
+        st.cooperative_only = cooperative_only
+        st.should_interrupt = should_interrupt
+        try:
+            yield
+        finally:
+            # Serialize teardown with a request that is waking a blocking call.
+            with st.cancel_cond:
+                clear_interrupt()
+                _State.unregister_current_thread()
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -702,8 +740,10 @@ class InterruptibleThread(_ORIG_THREAD):
         try:
             loop.call_soon_threadsafe(_cancel)
         except RuntimeError:
-            # Loop already closed; fall back to async injection.
-            self._inject_exc()
+            # A host supplying checkpoints must retain its delivery policy even
+            # when the loop has already closed.
+            if not st.cooperative_only:
+                self._inject_exc()
 
     def interrupt(self, recursive: bool = False) -> None:
         st = _State.get_state_by_ident(self.ident)
@@ -774,7 +814,7 @@ class InterruptibleThread(_ORIG_THREAD):
                 # or blocking primitive is still delivered via the durable flag;
                 # only a checkpoint-less pure-Python loop is left uninterruptible
                 # while tracing (a narrow, documented gap).
-                if not _tracing_active():
+                if not st.cooperative_only and not _tracing_active():
                     self._inject_exc()
                     st.async_armed = True
 
@@ -794,6 +834,8 @@ class InterruptibleThread(_ORIG_THREAD):
         interrupt_exc: type[BaseException] = ThreadInterrupted,
         legacy_keyboardinterrupt: bool = False,
         monkeypatch_socket: bool = False,
+        monkeypatch_thread: bool = True,
+        monkeypatch_selector: bool = True,
     ) -> None:
         """Install the stdlib monkeypatches that make blocking calls interruptible.
 
@@ -803,6 +845,10 @@ class InterruptibleThread(_ORIG_THREAD):
         ``ThreadInterrupted`` and ``KeyboardInterrupt`` handlers.
         ``monkeypatch_socket``: also swap blocking ``socket.recv/send/accept`` for
         their interruptible variants process-wide (off by default; large blast radius).
+        ``monkeypatch_thread``: let threads created by registered threads inherit
+        interruption support. Disable when a host owns thread construction.
+        ``monkeypatch_selector``: replace the default selector. Disable when a
+        host owns an event loop and cancels individual tasks itself.
         """
         global _INTERRUPT_EXC
         if cls._patches_installed:
@@ -815,7 +861,9 @@ class InterruptibleThread(_ORIG_THREAD):
             _INTERRUPT_EXC = interrupt_exc
 
         time.sleep = _coop_sleep  # type: ignore
-        selectors.DefaultSelector = _InterruptibleSelector  # type: ignore
+        if monkeypatch_selector:
+            cls._selector_patched = True
+            selectors.DefaultSelector = _InterruptibleSelector  # type: ignore
         select.select = _patched_select  # type: ignore
         threading.Condition.wait = _patched_cond_wait  # type: ignore
 
@@ -825,13 +873,16 @@ class InterruptibleThread(_ORIG_THREAD):
             _socket.socket.send = _sock_send_patch  # type: ignore
             _socket.socket.accept = _sock_accept_patch  # type: ignore
 
-        del threading.Thread
-        threading.__getattr__ = cls.get_thread_cls_for_current_thread  # type: ignore
+        if monkeypatch_thread:
+            cls._thread_patched = True
+            del threading.Thread
+            threading.__getattr__ = cls.get_thread_cls_for_current_thread  # type: ignore
 
         def __dir__():
             return list(threading.__dict__.keys()) + [_ORIG_THREAD.__name__]
 
-        threading.__dir__ = __dir__  # type: ignore
+        if monkeypatch_thread:
+            threading.__dir__ = __dir__  # type: ignore
 
     @classmethod
     def uninstall_patches(cls) -> None:
@@ -841,16 +892,20 @@ class InterruptibleThread(_ORIG_THREAD):
         cls._patches_installed = False
         time.sleep = _ORIG_SLEEP
         select.select = _ORIG_SELECT  # type: ignore
-        selectors.DefaultSelector = _ORIG_DEFAULT_SELECTOR  # type: ignore
+        if cls._selector_patched:
+            selectors.DefaultSelector = _ORIG_DEFAULT_SELECTOR  # type: ignore
+            cls._selector_patched = False
         threading.Condition.wait = _ORIG_COND_WAIT  # type: ignore
         if cls._socket_patched:
             _socket.socket.recv = _ORIG_SOCK_RECV  # type: ignore
             _socket.socket.send = _ORIG_SOCK_SEND  # type: ignore
             _socket.socket.accept = _ORIG_SOCK_ACCEPT  # type: ignore
             cls._socket_patched = False
-        threading.Thread = _ORIG_THREAD  # type: ignore
-        del threading.__getattr__  # type: ignore
-        del threading.__dir__  # type: ignore
+        if cls._thread_patched:
+            threading.Thread = _ORIG_THREAD  # type: ignore
+            del threading.__getattr__
+            del threading.__dir__
+            cls._thread_patched = False
         _INTERRUPT_EXC = ThreadInterrupted
 
 

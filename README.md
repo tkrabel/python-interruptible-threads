@@ -61,8 +61,9 @@ interruption of worker threads on CPython.
 | Name | Purpose |
 | --- | --- |
 | `InterruptibleThread(...)` | `threading.Thread` subclass with `.interrupt(recursive=False)`. |
-| `InterruptibleThread.install_patches(interrupt_exc=ThreadInterrupted, legacy_keyboardinterrupt=False, monkeypatch_socket=False)` | Install the stdlib patches (process-wide). |
+| `InterruptibleThread.install_patches(interrupt_exc=ThreadInterrupted, legacy_keyboardinterrupt=False, monkeypatch_socket=False, monkeypatch_thread=True, monkeypatch_selector=True)` | Install the stdlib patches (process-wide); optionally preserve thread construction and the default selector. |
 | `InterruptibleThread.uninstall_patches()` | Restore the originals. |
+| `thread.interruption_scope(cooperative_only=False, should_interrupt=None)` | Register one execution on a host-managed thread that overrides `run()`. |
 | `InterruptibleThread.run_interruptible(coro)` | Run a coroutine via `asyncio.run` with clean, cancellation-based interruption. |
 | `ThreadInterrupted` | Default interrupt exception (subclass of `BaseException`). |
 | `is_interrupted(thread=None)` | Whether an interrupt is pending (non-consuming). |
@@ -109,6 +110,74 @@ def worker():
 
 `run_interruptible` cancels the loop's tasks via `call_soon_threadsafe` (proper
 `finally` / `async with` unwind) instead of injecting an exception into the selector.
+
+### Embedding in a persistent host, such as ipykernel
+
+An ipykernel subshell's thread and event loop outlive any individual command.
+Interrupting a command should leave that thread available for the next command.
+The host also owns thread creation and already has an event loop, so it needs
+different boundaries from `InterruptibleThread.run()` and `run_interruptible()`.
+
+Install the blocking-call patches while retaining the host's thread and selector
+constructors:
+
+```python
+InterruptibleThread.install_patches(
+    interrupt_exc=KeyboardInterrupt,
+    monkeypatch_thread=False,
+    monkeypatch_selector=False,
+)
+```
+
+Have the host construct an `InterruptibleThread` subclass whose `run()` retains
+the host's runner. For example, ipykernel can combine its `SubshellThread` with
+`InterruptibleThread`, with the host's `run()` taking precedence. Inside that
+thread, wrap each user execution as follows (the callables are supplied by the
+host):
+
+```python
+with thread.interruption_scope(
+    cooperative_only=True,
+    should_interrupt=is_running_this_command,
+):
+    execute_user_code()
+```
+
+The scope registers the current thread and removes its registration on exit,
+including exception exit. It clears pending interruption and closes any wakeup
+pipe, so a request from one execution does not remain pending for the next.
+Call the scope only on the current thread, without an existing registration;
+scopes cannot nest, and ordinary `InterruptibleThread.run()` already registers
+the thread. A host should route requests only to active scopes: `interrupt()` on
+an unregistered thread raises `ValueError`.
+
+`cooperative_only=True` disables async exception injection while retaining the
+pending flag and blocking-call wakeups. The host must provide `check_interrupt()`
+checkpoints for CPU work; this option alone cannot stop an arbitrary CPU loop.
+For example, a Python 3.12+ host can supply checkpoints using `sys.monitoring`
+without replacing debugger trace hooks. No monitoring callbacks are installed
+by this library.
+
+`should_interrupt` gates cooperative delivery, including exit from
+`critical_section()`. A false result leaves the request pending. This matters
+when a command is suspended in an `await`: its scope remains open while the same
+thread services other tasks or event-loop callbacks. The host can check the
+current task or user-code stack to prevent those callbacks from consuming the
+command's interrupt. The predicate runs on the target thread under the interruption
+state lock and must be fast, non-blocking, and non-raising. It does not constrain
+async exception injection; use `cooperative_only=True` when delivery must obey it.
+
+For suspended coroutines, the host should cancel the execution task on its
+existing loop with `loop.call_soon_threadsafe(task.cancel)`. Keep
+`run_interruptible()` for callers that want the library to own an `asyncio.run()`
+lifecycle. Preserving the default selector avoids delivering an exception into
+the host loop's own selector wait.
+
+The patch options default to `True`, preserving existing behavior. Disabling them
+still patches `time.sleep`, `select.select`, and `Condition.wait`; these delegate
+to their originals on the main thread and unregistered threads. With thread
+patching disabled, user-created threads do not automatically inherit registration.
+Install patches before user code can capture aliases of the blocking functions.
 
 ## Limitations
 

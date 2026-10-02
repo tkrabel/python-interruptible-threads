@@ -8,6 +8,8 @@ from __future__ import annotations
 import contextlib
 import os
 import queue
+import select
+import selectors
 import socket
 import sys
 import threading
@@ -89,7 +91,9 @@ class Result:
         self.done = threading.Event()
 
 
-def run_worker(fn, *, daemon=True) -> tuple[InterruptibleThread, Result]:
+def run_worker(
+    fn, *, daemon=True, thread_cls=InterruptibleThread
+) -> tuple[InterruptibleThread, Result]:
     res = Result()
 
     def target():
@@ -101,7 +105,7 @@ def run_worker(fn, *, daemon=True) -> tuple[InterruptibleThread, Result]:
         finally:
             res.done.set()
 
-    t = InterruptibleThread(target=target, daemon=daemon)
+    t = thread_cls(target=target, daemon=daemon)
     t.start()
     res.started.wait(5)
     return t, res
@@ -555,6 +559,297 @@ def test_patch_round_trip():
     assert threading.Thread is it._ORIG_THREAD
     assert time.sleep is it._ORIG_SLEEP
     assert threading.Condition.wait is it._ORIG_COND_WAIT
+
+
+class HostedThread(InterruptibleThread):
+    """Model a framework that owns run() and registers only individual commands."""
+
+    def run(self):
+        it._ORIG_THREAD.run(self)
+
+
+@pytest.fixture
+def hosted_patches():
+    InterruptibleThread.install_patches(
+        monkeypatch_thread=False, monkeypatch_selector=False
+    )
+    try:
+        yield
+    finally:
+        InterruptibleThread.uninstall_patches()
+
+
+@pytest.mark.parametrize("patch_thread", [False, True])
+@pytest.mark.parametrize("patch_selector", [False, True])
+def test_optional_patch_round_trip(patch_thread, patch_selector):
+    original_thread = threading.Thread
+    original_selector = selectors.DefaultSelector
+    InterruptibleThread.install_patches(
+        monkeypatch_thread=patch_thread, monkeypatch_selector=patch_selector
+    )
+    try:
+
+        def fn(res):
+            return isinstance(threading.Thread(), InterruptibleThread)
+
+        t, res = run_worker(fn)
+        t.join(2)
+        assert not t.is_alive()
+        assert res.exc is None
+        assert res.value is patch_thread
+        assert (selectors.DefaultSelector is not original_selector) is patch_selector
+    finally:
+        InterruptibleThread.uninstall_patches()
+    assert threading.Thread is original_thread
+    assert selectors.DefaultSelector is original_selector
+    assert time.sleep is _REAL_SLEEP
+
+
+@pytest.mark.parametrize("block", ["sleep", "select", "event", "queue"])
+def test_scoped_blocking_interrupt_reuses_host_thread(hosted_patches, block):
+    ready = queue.Queue()
+
+    def fn(res):
+        thread = threading.current_thread()
+        interrupted = []
+        for command in range(3):
+            with thread.interruption_scope(cooperative_only=True):
+                ready.put(command)
+                try:
+                    if block == "sleep":
+                        time.sleep(10)
+                    elif block == "select":
+                        select.select([], [], [], 10)
+                    elif block == "event":
+                        threading.Event().wait(10)
+                    else:
+                        queue.Queue().get(timeout=10)
+                except ThreadInterrupted:
+                    interrupted.append(command)
+            # The enclosing host continues outside each execution scope.
+            check_interrupt()
+            assert not is_interrupted()
+        return interrupted
+
+    t, res = run_worker(fn, thread_cls=HostedThread)
+    for command in range(3):
+        assert ready.get(timeout=2) == command
+        t.interrupt()
+    t.join(3)
+    assert not t.is_alive()
+    assert res.exc is None
+    assert res.value == [0, 1, 2]
+
+
+@pytest.mark.parametrize("tracing", [False, True])
+def test_cooperative_scope_waits_for_checkpoint(hosted_patches, tracing):
+    ready = threading.Event()
+
+    def fn(res):
+        with threading.current_thread().interruption_scope(cooperative_only=True):
+            ready.set()
+            deadline = time.monotonic() + 3
+            while not is_interrupted():
+                assert time.monotonic() < deadline
+            # No async exception may escape into this computation, even without tracing.
+            res.before_checkpoint = True
+            with pytest.raises(ThreadInterrupted):
+                check_interrupt()
+            assert not is_interrupted()
+            check_interrupt()
+        return 42
+
+    with _global_tracing() if tracing else contextlib.nullcontext():
+        t, res = run_worker(fn, thread_cls=HostedThread)
+        assert ready.wait(2)
+        t.interrupt()
+        t.join(3)
+    assert not t.is_alive()
+    assert res.exc is None
+    assert res.before_checkpoint
+    assert res.value == 42
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_scope_predicate_defers_delivery(hosted_patches, masked):
+    ready = threading.Event()
+
+    def fn(res):
+        allowed = False
+        with threading.current_thread().interruption_scope(
+            cooperative_only=True, should_interrupt=lambda: allowed
+        ):
+            with critical_section() if masked else contextlib.nullcontext():
+                ready.set()
+                deadline = time.monotonic() + 3
+                while not is_interrupted():
+                    assert time.monotonic() < deadline
+                check_interrupt()
+                time.sleep(0)
+            assert is_interrupted()
+            allowed = True
+            with pytest.raises(ThreadInterrupted):
+                check_interrupt()
+            assert not is_interrupted()
+        return 42
+
+    t, res = run_worker(fn, thread_cls=HostedThread)
+    assert ready.wait(2)
+    t.interrupt()
+    t.join(3)
+    assert not t.is_alive()
+    assert res.exc is None
+    assert res.value == 42
+
+
+def test_scope_failure_clears_pending_and_closes_pipe(hosted_patches):
+    ready = threading.Event()
+
+    def fn(res):
+        thread = threading.current_thread()
+        with pytest.raises(
+            ValueError, match="command failed"
+        ), thread.interruption_scope(
+            cooperative_only=True, should_interrupt=lambda: False
+        ):
+            select.select([], [], [], 0)
+            state = it._State.get_state_by_ident()
+            fds = (state.rfd, state.wfd)
+            ready.set()
+            deadline = time.monotonic() + 3
+            while not is_interrupted():
+                assert time.monotonic() < deadline
+            raise ValueError("command failed")
+        for fd in fds:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+        with thread.interruption_scope(cooperative_only=True):
+            check_interrupt()
+            time.sleep(0)
+        return 42
+
+    t, res = run_worker(fn, thread_cls=HostedThread)
+    assert ready.wait(2)
+    t.interrupt()
+    t.join(3)
+    assert not t.is_alive()
+    assert res.exc is None
+    assert res.value == 42
+
+
+def test_cooperative_scope_closed_loop_keeps_interrupt_pending(hosted_patches):
+    import asyncio
+
+    def fn(res):
+        thread = threading.current_thread()
+        with thread.interruption_scope(cooperative_only=True):
+            # Exercise the existing fallback for a loop closed before cancellation.
+            loop = asyncio.new_event_loop()
+            loop.close()
+            state = it._State.get_state_by_ident()
+            state.event_loop = loop
+            try:
+                thread.interrupt()
+                assert is_interrupted()
+                with pytest.raises(ThreadInterrupted):
+                    check_interrupt()
+            finally:
+                state.event_loop = None
+        return 42
+
+    t, res = run_worker(fn, thread_cls=HostedThread)
+    t.join(3)
+    assert not t.is_alive()
+    assert res.exc is None
+    assert res.value == 42
+
+
+def test_scope_rejects_another_thread(hosted_patches):
+    thread = HostedThread()
+    with pytest.raises(
+        RuntimeError, match="current thread"
+    ), thread.interruption_scope():
+        pytest.fail("entered a scope for another thread")
+
+
+def test_scope_rejects_existing_registration_without_clearing_it(hosted_patches):
+    def fn(res):
+        thread = threading.current_thread()
+        with critical_section():
+            thread.interrupt()
+            with pytest.raises(
+                RuntimeError, match="already registered"
+            ), thread.interruption_scope():
+                pytest.fail("replaced an existing registration")
+            assert clear_interrupt()
+        return 42
+
+    t, res = run_worker(fn)
+    t.join(3)
+    assert not t.is_alive()
+    assert res.exc is None
+    assert res.value == 42
+
+
+def test_scoped_async_command_preserves_host_loop(hosted_patches):
+    import asyncio
+
+    ready = queue.Queue()
+
+    def fn(res):
+        async def host():
+            release_background = asyncio.Event()
+            background = asyncio.create_task(release_background.wait())
+
+            async def command():
+                task = asyncio.current_task()
+                with threading.current_thread().interruption_scope(
+                    cooperative_only=True,
+                    should_interrupt=lambda: asyncio.current_task() is task,
+                ):
+                    ready.put((asyncio.get_running_loop(), task))
+                    await asyncio.Event().wait()
+
+            task = asyncio.create_task(command())
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert not background.done()
+                release_background.set()
+                assert await background
+                with threading.current_thread().interruption_scope(
+                    cooperative_only=True
+                ):
+                    await asyncio.sleep(0)
+                    check_interrupt()
+                return 42
+            finally:
+                background.cancel()
+
+        # The scope must coexist with a host loop that already exists.
+        return asyncio.run(host())
+
+    t, res = run_worker(fn, thread_cls=HostedThread)
+    loop, task = ready.get(timeout=2)
+    t.interrupt()
+    callback_errors = []
+
+    def cancel_command():
+        try:
+            # This callback runs on the same thread, outside the command task.
+            check_interrupt()
+            assert is_interrupted()
+        except BaseException as error:  # noqa: BLE001 - report to the test
+            callback_errors.append(error)
+        finally:
+            task.cancel()
+
+    loop.call_soon_threadsafe(cancel_command)
+    t.join(3)
+    assert not t.is_alive()
+    assert not callback_errors
+    assert res.exc is None
+    assert res.value == 42
 
 
 if __name__ == "__main__":
